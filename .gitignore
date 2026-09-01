@@ -1,4 +1,8 @@
 .env
 *.env
+.env.local
 credentials.json
 __pycache__/
+node_modules/
+.next/
+.pytest_cache/

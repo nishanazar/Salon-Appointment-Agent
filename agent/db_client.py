@@ -227,3 +227,137 @@ if __name__ == "__main__":
         print(f"\n=== get_free_slots(service_id={sid}, date={today}) ===")
         slots = get_free_slots(sid, today)
         print(f"  Slots: {slots}")
+
+
+# ── cancel booking ───────────────────────────────────────────────────────────
+
+def get_customer_appointments(phone: str) -> list[dict]:
+    """Return this customer's own upcoming confirmed appointments."""
+    customer = sb.table("customers").select("id").eq("phone", phone).execute()
+    if not customer.data:
+        return []
+    customer_id = customer.data[0]["id"]
+
+    res = sb.table("appointments") \
+        .select("id, start_time, end_time, status, services(name, price)") \
+        .eq("customer_id", customer_id) \
+        .eq("status", "confirmed") \
+        .order("start_time") \
+        .execute()
+
+    return [
+        {
+            "id": appt["id"],
+            "service": appt["services"]["name"] if appt.get("services") else "Unknown",
+            "price": appt["services"]["price"] if appt.get("services") else None,
+            "start_time": appt["start_time"],
+        }
+        for appt in res.data
+    ]
+
+
+def cancel_appointment(phone: str, appointment_id: str) -> dict:
+    """Cancel an appointment — ONLY if it belongs to this phone number."""
+    customer = sb.table("customers").select("id").eq("phone", phone).execute()
+    if not customer.data:
+        raise ValueError("No customer found with this phone number")
+    customer_id = customer.data[0]["id"]
+
+    appt = sb.table("appointments").select("id, customer_id, status") \
+        .eq("id", appointment_id).execute()
+    if not appt.data:
+        raise ValueError("Appointment not found")
+
+    if appt.data[0]["customer_id"] != customer_id:
+        raise ValueError("Appointment not found")
+
+    if appt.data[0]["status"] == "cancelled":
+        raise ValueError("This appointment is already cancelled")
+
+    sb.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).execute()
+
+    return {"id": appointment_id, "status": "cancelled"}
+
+
+# ── reschedule booking ───────────────────────────────────────────────────────
+
+def reschedule_appointment(phone: str, appointment_id: str, new_start_time: datetime) -> dict:
+    """Reschedule an appointment — ONLY if it belongs to this phone number."""
+    customer = sb.table("customers").select("id").eq("phone", phone).execute()
+    if not customer.data:
+        raise ValueError("No customer found with this phone number")
+    customer_id = customer.data[0]["id"]
+
+    appt = sb.table("appointments").select("id, customer_id, service_id, staff_id, status") \
+        .eq("id", appointment_id).execute()
+    if not appt.data:
+        raise ValueError("Appointment not found")
+
+    appt_row = appt.data[0]
+    if appt_row["customer_id"] != customer_id:
+        raise ValueError("Appointment not found")
+
+    if appt_row["status"] != "confirmed":
+        raise ValueError("Only confirmed appointments can be rescheduled")
+
+    service = get_service(appt_row["service_id"])
+    if not service:
+        raise ValueError("Service not found")
+
+    new_end_time = new_start_time + timedelta(minutes=service["duration_minutes"])
+
+    q = sb.table("appointments").select("id").eq("status", "confirmed") \
+        .lt("start_time", new_end_time.isoformat()).gt("end_time", new_start_time.isoformat()) \
+        .neq("id", appointment_id)
+    if appt_row["staff_id"]:
+        q = q.eq("staff_id", appt_row["staff_id"])
+    conflict = q.execute()
+    if conflict.data:
+        raise ValueError("New slot is not available")
+
+    sb.table("appointments").update({
+        "start_time": new_start_time.isoformat(),
+        "end_time": new_end_time.isoformat(),
+    }).eq("id", appointment_id).execute()
+
+    return {
+        "id": appointment_id,
+        "service": service["name"],
+        "new_start_time": new_start_time.isoformat(),
+        "new_end_time": new_end_time.isoformat(),
+        "status": "confirmed",
+    }
+
+
+# ── reminders ─────────────────────────────────────────────────────────────────
+
+def get_pending_reminders() -> list[dict]:
+    """Appointments jinki start_time agle 60 minutes mein hai,
+    status='confirmed', aur reminder abhi tak nahi bheja gaya."""
+    now = datetime.now()
+    window_end = now + timedelta(minutes=60)
+
+    res = sb.table("appointments") \
+        .select("id, start_time, customers(name, phone), services(name)") \
+        .eq("status", "confirmed") \
+        .eq("reminder_sent", False) \
+        .gte("start_time", now.isoformat()) \
+        .lte("start_time", window_end.isoformat()) \
+        .execute()
+
+    return [
+        {
+            "appointment_id": appt["id"],
+            "customer_name": appt["customers"]["name"] if appt.get("customers") else "Customer",
+            "customer_phone": appt["customers"]["phone"] if appt.get("customers") else None,
+            "service": appt["services"]["name"] if appt.get("services") else "Unknown",
+            "start_time": appt["start_time"],
+        }
+        for appt in res.data
+    ]
+
+
+def mark_reminder_sent(appointment_id: str) -> dict:
+    """Reminder bhej diye jane ke baad mark karo, dobara na bheje."""
+    sb.table("appointments").update({"reminder_sent": True}).eq("id", appointment_id).execute()
+    return {"id": appointment_id, "reminder_sent": True}
