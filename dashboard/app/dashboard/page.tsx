@@ -12,6 +12,7 @@ interface AppointmentRow {
   end_time: string;
   status: string;
   reminder_sent: boolean | null;
+  customer_name_snapshot: string | null;
   customers: { name: string; phone: string } | null;
   services: { name: string } | null;
   staff: { name: string } | null;
@@ -64,7 +65,7 @@ export default async function DashboardPage() {
   const { data, error } = await supabase
     .from("appointments")
     .select(
-      `id, start_time, end_time, status, reminder_sent, customers:customer_id ( name, phone ), services:service_id ( name ), staff:staff_id ( name )`
+      `id, start_time, end_time, status, reminder_sent, customer_name_snapshot, customers:customer_id ( name, phone ), services:service_id ( name ), staff:staff_id ( name )`
     )
     .order("start_time", { ascending: false });
 
@@ -143,7 +144,7 @@ export default async function DashboardPage() {
                 {dueSoon
                   .map(
                     (a) =>
-                      `${a.customers?.name ?? "Customer"} @ ${formatTime(a.start_time)}`
+                      `${a.customer_name_snapshot ?? a.customers?.name ?? "Customer"} @ ${formatTime(a.start_time)}`
                   )
                   .join(" \u00B7 ")}
               </p>
@@ -258,10 +259,10 @@ export default async function DashboardPage() {
                         <td className="px-6 py-4">
                           <div className="flex items-center gap-3">
                             <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center text-white text-xs font-bold shrink-0">
-                              {(apt.customers?.name ?? "?").charAt(0).toUpperCase()}
+                              {(apt.customer_name_snapshot ?? apt.customers?.name ?? "?").charAt(0).toUpperCase()}
                             </div>
                             <span className="font-medium text-gray-800">
-                              {apt.customers?.name ?? "-"}
+                              {apt.customer_name_snapshot ?? apt.customers?.name ?? "-"}
                             </span>
                           </div>
                         </td>

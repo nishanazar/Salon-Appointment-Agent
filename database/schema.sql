@@ -54,6 +54,8 @@ CREATE TABLE appointments (
     start_time TIMESTAMP NOT NULL,
     end_time TIMESTAMP NOT NULL,
     status VARCHAR(20) DEFAULT 'confirmed' CHECK (status IN ('pending', 'confirmed', 'cancelled', 'completed')),
+    reminder_sent BOOLEAN DEFAULT FALSE,
+    customer_name_snapshot TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     EXCLUDE USING gist (
         staff_id WITH =,

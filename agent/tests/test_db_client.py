@@ -16,8 +16,10 @@ from db_client import (
     book_appointment,
     cancel_appointment,
     get_customer_appointments,
+    get_or_create_customer,
     get_services,
     reschedule_appointment,
+    sb,
 )
 
 
@@ -166,3 +168,155 @@ def test_phone_customer_lookup(register_phone):
     assert bogus_appts == [], (
         f"Expected no appointments for unknown phone, got: {bogus_appts}"
     )
+
+
+# ── get_or_create_customer tests ─────────────────────────────────────────────
+
+def test_create_new_customer(register_phone):
+    """A brand-new phone+name must insert a row and return its id."""
+    phone = "9990000010"
+    register_phone(phone)
+
+    cid = get_or_create_customer(phone, "Ali Khan")
+    assert isinstance(cid, int), f"Expected int id, got {type(cid)}"
+
+    # Verify the row actually exists with correct data
+    row = sb.table("customers").select("id, name, phone").eq("phone", phone).execute().data
+    assert len(row) == 1
+    assert row[0]["name"] == "Ali Khan"
+    assert row[0]["id"] == cid
+
+
+def test_existing_customer_same_name_no_update(register_phone):
+    """If the customer exists and the same name is passed, no update
+    should happen — just return the existing id."""
+    phone = "9990000011"
+    register_phone(phone)
+
+    cid1 = get_or_create_customer(phone, "Sara Ahmed")
+    cid2 = get_or_create_customer(phone, "Sara Ahmed")
+
+    assert cid1 == cid2, "Same phone must return the same customer id"
+
+    row = sb.table("customers").select("name").eq("phone", phone).execute().data[0]
+    assert row["name"] == "Sara Ahmed"
+
+
+def test_existing_customer_different_name_updates(register_phone):
+    """If the customer exists and a DIFFERENT name is passed, the name
+    must be updated to the latest value."""
+    phone = "9990000012"
+    register_phone(phone)
+
+    cid1 = get_or_create_customer(phone, "Fatima Old")
+    cid2 = get_or_create_customer(phone, "Fatima New")
+
+    assert cid1 == cid2, "Same phone must return the same customer id"
+
+    row = sb.table("customers").select("name").eq("phone", phone).execute().data[0]
+    assert row["name"] == "Fatima New", (
+        f"Expected name to be updated to 'Fatima New', got {row['name']!r}"
+    )
+
+
+def test_existing_customer_none_name_keeps_old(register_phone):
+    """If name=None is passed for an existing customer, the old name
+    must remain unchanged."""
+    phone = "9990000013"
+    register_phone(phone)
+
+    cid1 = get_or_create_customer(phone, "Hassan Original")
+    cid2 = get_or_create_customer(phone, None)  # no name provided
+
+    assert cid1 == cid2
+
+    row = sb.table("customers").select("name").eq("phone", phone).execute().data[0]
+    assert row["name"] == "Hassan Original", (
+        f"Name should remain 'Hassan Original' when None passed, got {row['name']!r}"
+    )
+
+
+def test_existing_customer_empty_name_keeps_old(register_phone):
+    """If an empty-string name is passed for an existing customer, the
+    old name must remain unchanged."""
+    phone = "9990000014"
+    register_phone(phone)
+
+    cid1 = get_or_create_customer(phone, "Zainab Keep")
+    cid2 = get_or_create_customer(phone, "")  # empty string
+
+    assert cid1 == cid2
+
+    row = sb.table("customers").select("name").eq("phone", phone).execute().data[0]
+    assert row["name"] == "Zainab Keep", (
+        f"Name should remain 'Zainab Keep' when empty string passed, got {row['name']!r}"
+    )
+
+
+def test_new_customer_no_name_raises():
+    """Creating a customer without a name (None) must raise ValueError."""
+    with pytest.raises(ValueError, match="name is required"):
+        get_or_create_customer("9990000099", None)
+
+
+def test_book_appointment_updates_customer_name(register_phone):
+    """End-to-end: booking with a changed name must update the
+    customer record via get_or_create_customer."""
+    service = _get_test_service()
+    phone = "9990000015"
+    register_phone(phone)
+
+    date_str = _future_date()
+
+    # First booking with old name
+    book_appointment(phone, "Old Name", service["id"], f"{date_str} 11:00")
+
+    # Second booking with new name (different time to avoid conflict)
+    book_appointment(phone, "New Name", service["id"], f"{date_str} 14:00")
+
+    row = sb.table("customers").select("name").eq("phone", phone).execute().data[0]
+    assert row["name"] == "New Name", (
+        f"book_appointment should update customer name, got {row['name']!r}"
+    )
+
+
+def test_appointment_name_snapshot_preserved(register_phone):
+    """Each appointment must freeze the customer name at booking time.
+    Even if the customer's name changes later, old appointments must
+    still show the original snapshot."""
+    service = _get_test_service()
+    phone = "9990000016"
+    register_phone(phone)
+
+    date_str = _future_date()
+
+    # First booking with original name
+    appt1 = book_appointment(phone, "Original Name", service["id"], f"{date_str} 11:00")
+
+    # Second booking updates the customer name to a new value
+    appt2 = book_appointment(phone, "Updated Name", service["id"], f"{date_str} 14:00")
+
+    # Verify: appt1 should still have "Original Name" as snapshot
+    row1 = sb.table("appointments").select("customer_name_snapshot") \
+        .eq("id", appt1["id"]).execute().data[0]
+    assert row1["customer_name_snapshot"] == "Original Name", (
+        f"First appointment snapshot should be 'Original Name', "
+        f"got {row1['customer_name_snapshot']!r}"
+    )
+
+    # Verify: appt2 should have "Updated Name" as snapshot
+    row2 = sb.table("appointments").select("customer_name_snapshot") \
+        .eq("id", appt2["id"]).execute().data[0]
+    assert row2["customer_name_snapshot"] == "Updated Name", (
+        f"Second appointment snapshot should be 'Updated Name', "
+        f"got {row2['customer_name_snapshot']!r}"
+    )
+
+    # Verify: get_customer_appointments returns the snapshot, not the live name
+    appts = get_customer_appointments(phone)
+    appt1_data = next(a for a in appts if a["id"] == appt1["id"])
+    appt2_data = next(a for a in appts if a["id"] == appt2["id"])
+    assert appt1_data["customer_name"] == "Original Name", (
+        f"get_customer_appointments should return snapshot, got {appt1_data['customer_name']!r}"
+    )
+    assert appt2_data["customer_name"] == "Updated Name"

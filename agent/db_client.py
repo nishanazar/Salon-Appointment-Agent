@@ -56,6 +56,34 @@ def _get_existing_appointments(staff_id: int, date_str: str) -> list:
 
 # ── public API ────────────────────────────────────────────────────────────────
 
+def get_or_create_customer(phone: str, name: str | None = None) -> int:
+    """
+    Look up a customer by phone number.
+    - If found AND a non-empty `name` is provided that differs from the stored
+      name, UPDATE the customer record to the latest name.
+    - If found AND `name` is None/empty, leave the existing name untouched.
+    - If not found, INSERT a new row (name is required in that case).
+    Returns the customer id.
+    """
+    rows = sb.table("customers").select("id, name").eq("phone", phone).execute().data
+
+    if rows:
+        customer_id = rows[0]["id"]
+        existing_name = rows[0].get("name")
+        if name and name != existing_name:
+            sb.table("customers").update({"name": name}).eq("id", customer_id).execute()
+            print(f"[db_client] Updated customer #{customer_id} name: {existing_name!r} -> {name!r}")
+        return customer_id
+
+    # New customer — name is required
+    if not name:
+        raise ValueError("A name is required when creating a new customer")
+    inserted = sb.table("customers").insert({"phone": phone, "name": name}).execute()
+    customer_id = inserted.data[0]["id"]
+    print(f"[db_client] Created new customer #{customer_id}: {name!r} ({phone})")
+    return customer_id
+
+
 def get_services() -> list[dict]:
     """Return all active services."""
     rows = (
@@ -172,12 +200,7 @@ def book_appointment(
         raise ValueError(f"Service {service_id} not found")
 
     # ── upsert customer ───────────────────────────────────────────────────────
-    cust_rows = sb.table("customers").select("id").eq("phone", phone).execute().data
-    if cust_rows:
-        customer_id = cust_rows[0]["id"]
-    else:
-        inserted = sb.table("customers").insert({"phone": phone, "name": name}).execute()
-        customer_id = inserted.data[0]["id"]
+    customer_id = get_or_create_customer(phone, name)
 
     # ── resolve staff ─────────────────────────────────────────────────────────
     if not staff_id:
@@ -198,6 +221,7 @@ def book_appointment(
         "start_time": start_dt.isoformat(),
         "end_time": end_dt.isoformat(),
         "status": "confirmed",
+        "customer_name_snapshot": name,
     }
 
     try:
@@ -239,7 +263,7 @@ def get_customer_appointments(phone: str) -> list[dict]:
     customer_id = customer.data[0]["id"]
 
     res = sb.table("appointments") \
-        .select("id, start_time, end_time, status, services(name, price)") \
+        .select("id, start_time, end_time, status, customer_name_snapshot, services(name, price)") \
         .eq("customer_id", customer_id) \
         .eq("status", "confirmed") \
         .order("start_time") \
@@ -248,6 +272,7 @@ def get_customer_appointments(phone: str) -> list[dict]:
     return [
         {
             "id": appt["id"],
+            "customer_name": appt.get("customer_name_snapshot") or "Customer",
             "service": appt["services"]["name"] if appt.get("services") else "Unknown",
             "price": appt["services"]["price"] if appt.get("services") else None,
             "start_time": appt["start_time"],
@@ -338,7 +363,7 @@ def get_pending_reminders() -> list[dict]:
     window_end = now + timedelta(minutes=60)
 
     res = sb.table("appointments") \
-        .select("id, start_time, customers(name, phone), services(name)") \
+        .select("id, start_time, customer_name_snapshot, customers(phone), services(name)") \
         .eq("status", "confirmed") \
         .eq("reminder_sent", False) \
         .gte("start_time", now.isoformat()) \
@@ -348,7 +373,7 @@ def get_pending_reminders() -> list[dict]:
     return [
         {
             "appointment_id": appt["id"],
-            "customer_name": appt["customers"]["name"] if appt.get("customers") else "Customer",
+            "customer_name": appt.get("customer_name_snapshot") or "Customer",
             "customer_phone": appt["customers"]["phone"] if appt.get("customers") else None,
             "service": appt["services"]["name"] if appt.get("services") else "Unknown",
             "start_time": appt["start_time"],
