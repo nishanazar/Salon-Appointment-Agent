@@ -10,7 +10,7 @@ export default function ClearLogButton({
   const [pending, setPending] = useState(false);
 
   async function handleClear() {
-    if (!window.confirm("Clear all activity? The log will start fresh.")) return;
+    if (!window.confirm("Clear today's activity? Today's rows will be permanently deleted from the database.")) return;
     setPending(true);
     try {
       const result = await clear();

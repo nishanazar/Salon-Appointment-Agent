@@ -1,119 +1,68 @@
-import { readFile, writeFile } from "fs/promises";
-import path from "path";
 import { revalidatePath } from "next/cache";
 import Link from "next/link";
 import Nav from "@/app/components/Nav";
 import ClearLogButton from "./ClearLogButton";
 import AutoRefresh from "./AutoRefresh";
+import { createSupabaseServerClient } from "@/lib/supabaseServer";
 
 // Always fetch fresh data - no ISR caching
 export const revalidate = 0;
 
-const LINES_SHOWN = 20;
+// Tool activity is stored in the Supabase tool_call_logs table (the MCP
+// server writes it alongside its local file log), so the local and the
+// Vercel-deployed dashboard read exactly the same data.
+const CALLS_SHOWN = 20; // "All" view
+const FETCH_LIMIT = 1000; // newest rows pulled for today-filtering
 
-interface LogEntry {
-  timestamp: string;
-  event: "CALL" | "OK" | "FAIL" | "CRASH";
-  tool: string;
-  detail: string;
+// created_at is stored UTC; render in the salon owner's timezone so the
+// local and Vercel dashboards are identical regardless of server timezone.
+const TIMEZONE = "Asia/Karachi";
+
+interface ToolCallRow {
+  id: string;
+  tool_name: string;
+  status: string;
+  params: Record<string, unknown> | null;
+  result: unknown;
+  created_at: string;
 }
 
-// Log format: 2026-09-01 10:47:47,265 | INFO | OK   tool_name | payload
-const LINE_RE =
-  /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \| \w+ \| (CALL|OK|FAIL|CRASH)\s+(\w+)\s*\| (.*)$/;
-
-function parseLine(line: string): LogEntry | null {
-  const m = line.match(LINE_RE);
-  if (!m) return null;
-  return {
-    timestamp: m[1],
-    event: m[2] as LogEntry["event"],
-    tool: m[3],
-    detail: summarize(m[2], m[4] ?? ""),
-  };
+async function fetchToolCalls(): Promise<{
+  rows: ToolCallRow[];
+  error: string | null;
+}> {
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("tool_call_logs")
+    .select("id, tool_name, status, params, result, created_at")
+    .order("created_at", { ascending: false })
+    .limit(FETCH_LIMIT);
+  if (error) return { rows: [], error: error.message };
+  return { rows: (data ?? []) as ToolCallRow[], error: null };
 }
 
-// Turn the raw payload into a short human-readable summary (never raw JSON).
-function summarize(event: string, payload: string): string {
-  if (event === "CRASH") return payload; // "ExceptionType: message" is already readable
-
-  const raw = event === "CALL" ? payload.replace(/^params=/, "") : payload;
-  let obj: Record<string, unknown> | null = null;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      obj = parsed as Record<string, unknown>;
-    }
-  } catch {
-    // payload is not JSON — fall through
-  }
-
-  if (event === "CALL") {
-    if (!obj) return "";
-    const parts = Object.entries(obj).map(([k, v]) => `${k}: ${String(v)}`);
-    return parts.length > 0 ? parts.join(" \u00B7 ") : "no parameters";
-  }
-
-  if (obj) {
-    if (typeof obj.message === "string" && obj.message.trim()) return obj.message;
-    const list = obj.appointments ?? obj.services ?? obj.available_slots;
-    if (Array.isArray(list)) {
-      return `${list.length} result${list.length === 1 ? "" : "s"} returned`;
-    }
-    if (obj.id !== undefined && obj.status !== undefined) {
-      return `Appointment #${obj.id} \u2014 ${obj.status}`;
-    }
-    if (event === "FAIL" && typeof obj.error === "string" && obj.error) {
-      return obj.error;
-    }
-  }
-  return "";
-}
-
-function eventConfig(event: string) {
-  switch (event) {
-    case "OK":
-      return {
-        icon: "\u2713",
-        iconCls: "bg-emerald-100 text-emerald-600",
-        label: "Success",
-        badge: "bg-emerald-100 text-emerald-700",
-      };
-    case "FAIL":
-    case "CRASH":
-      return {
-        icon: "\u2717",
-        iconCls: "bg-rose-100 text-rose-600",
-        label: "Error",
-        badge: "bg-rose-100 text-rose-700",
-      };
-    case "CALL":
-      return {
-        icon: "\u25B6",
-        iconCls: "bg-indigo-100 text-indigo-600",
-        label: "Called",
-        badge: "bg-indigo-100 text-indigo-700",
-      };
-    default:
-      return {
-        icon: "\u2022",
-        iconCls: "bg-gray-100 text-gray-600",
-        label: "Log",
-        badge: "bg-gray-100 text-gray-700",
-      };
-  }
+// Calendar date (YYYY-MM-DD) of an instant in the dashboard timezone.
+function zonedDateKey(value: Date | string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(value));
 }
 
 function formatTimestamp(ts: string): { date: string; time: string } {
-  const d = new Date(ts.replace(" ", "T"));
+  const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return { date: ts, time: "" };
   return {
     date: d.toLocaleDateString("en-IN", {
+      timeZone: TIMEZONE,
       day: "2-digit",
       month: "short",
       year: "numeric",
     }),
     time: d.toLocaleTimeString("en-IN", {
+      timeZone: TIMEZONE,
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
@@ -122,53 +71,81 @@ function formatTimestamp(ts: string): { date: string; time: string } {
   };
 }
 
-// Local calendar date (YYYY-MM-DD) for "today" filtering. Log timestamps
-// are local time, written by the Python server on this same machine.
-function todayLocalDate(): string {
-  const now = new Date();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${now.getFullYear()}-${m}-${d}`;
-}
-
-// Log lives next to the MCP server, one level above the dashboard folder.
-function logPaths(): string[] {
-  return [
-    path.join(process.cwd(), "logs", "tool-calls.log"),
-    path.join(process.cwd(), "..", "logs", "tool-calls.log"),
-  ];
-}
-
-async function readLogLines(): Promise<{
-  lines: string[];
-  notFound: boolean;
-  logPath: string | null;
-}> {
-  for (const p of logPaths()) {
-    try {
-      const content = await readFile(/*turbopackIgnore: true*/ p, "utf-8");
-      const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
-      return { lines, notFound: false, logPath: p };
-    } catch {
-      // try next candidate path
-    }
+// Short human-readable summary of a tool result (never raw JSON).
+function resultSummary(result: unknown): string {
+  if (result === null || result === undefined) return "";
+  if (Array.isArray(result)) {
+    return `${result.length} result${result.length === 1 ? "" : "s"} returned`;
   }
-  return { lines: [], notFound: true, logPath: null };
+  if (typeof result === "object") {
+    const obj = result as Record<string, unknown>;
+    if (typeof obj.message === "string" && obj.message.trim()) {
+      return obj.message;
+    }
+    const list = obj.appointments ?? obj.services ?? obj.available_slots ?? obj.pending_reminders;
+    if (Array.isArray(list)) {
+      return `${list.length} result${list.length === 1 ? "" : "s"} returned`;
+    }
+    if (obj.id !== undefined && obj.status !== undefined) {
+      return `Appointment #${obj.id} \u2014 ${obj.status}`;
+    }
+    if (obj.id !== undefined && obj.reminder_sent !== undefined) {
+      return `Reminder sent \u2014 appointment #${obj.id}`;
+    }
+    if (typeof obj.error === "string" && obj.error) return obj.error;
+    return "";
+  }
+  return String(result);
 }
 
-// Empties the log file so activity starts fresh. The file is truncated
-// (not deleted) because Windows locks the file while the MCP server has
-// it open — the server keeps appending new entries after it is cleared.
+function paramsSummary(params: Record<string, unknown> | null): string {
+  if (!params) return "";
+  const parts = Object.entries(params).map(([k, v]) => `${k}: ${String(v)}`);
+  return parts.length > 0 ? parts.join(" \u00B7 ") : "";
+}
+
+function statusConfig(status: string) {
+  if (status === "OK") {
+    return {
+      icon: "\u2713",
+      iconCls: "bg-emerald-100 text-emerald-600",
+      label: "Success",
+      badge: "bg-emerald-100 text-emerald-700",
+    };
+  }
+  return {
+    icon: "\u2717",
+    iconCls: "bg-rose-100 text-rose-600",
+    label: "Error",
+    badge: "bg-rose-100 text-rose-700",
+  };
+}
+
+// Deletes today's rows (dashboard timezone) from tool_call_logs so the
+// activity list starts fresh. This permanently deletes the rows from the
+// database — the local logs/tool-calls.log file is NOT touched.
 async function clearLog(): Promise<{ error?: string }> {
   "use server";
-  const { logPath } = await readLogLines();
-  if (!logPath) return {}; // nothing to clear
+  const supabase = createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("tool_call_logs")
+    .select("id, created_at")
+    .order("created_at", { ascending: false })
+    .limit(FETCH_LIMIT);
+  if (error) return { error: error.message };
 
-  try {
-    await writeFile(logPath, "");
-  } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
-  }
+  const todayKey = zonedDateKey(new Date());
+  const ids = (data ?? [])
+    .filter((row) => zonedDateKey(row.created_at) === todayKey)
+    .map((row) => row.id);
+  if (ids.length === 0) return {};
+
+  const { error: deleteError } = await supabase
+    .from("tool_call_logs")
+    .delete()
+    .in("id", ids);
+  if (deleteError) return { error: deleteError.message };
+
   revalidatePath("/dashboard/activity");
   return {};
 }
@@ -181,31 +158,25 @@ export default async function ActivityPage({
   const params = await searchParams;
   const showAll = params.range === "all"; // default view: today only
 
-  const { lines, notFound } = await readLogLines();
-  const parsed = lines
-    .map(parseLine)
-    .filter((e): e is LogEntry => e !== null);
+  const { rows, error: dbError } = await fetchToolCalls();
+  const todayKey = zonedDateKey(new Date());
 
-  // "Today" shows every entry from the current date; "All" falls back to
-  // the last N log lines so the list stays bounded.
-  const entries = (
-    showAll
-      ? parsed.slice(-LINES_SHOWN)
-      : parsed.filter((e) => e.timestamp.slice(0, 10) === todayLocalDate())
-  ).reverse(); // newest first
+  // "Today" shows every call from the current date; "All" falls back to
+  // the last N calls so the list stays bounded.
+  const entries = showAll
+    ? rows.slice(0, CALLS_SHOWN)
+    : rows.filter((row) => zonedDateKey(row.created_at) === todayKey);
 
-  const { date: todayDisplay } = formatTimestamp(`${todayLocalDate()} 00:00:00`);
+  const { date: todayDisplay } = formatTimestamp(new Date().toISOString());
 
-  const successCount = entries.filter((e) => e.event === "OK").length;
-  const errorCount = entries.filter(
-    (e) => e.event === "FAIL" || e.event === "CRASH"
-  ).length;
-  const callCount = entries.filter((e) => e.event === "CALL").length;
+  const successCount = entries.filter((e) => e.status === "OK").length;
+  const errorCount = entries.filter((e) => e.status !== "OK").length;
+  const callCount = entries.length;
 
   const chips = [
     { label: "Success", count: successCount, badge: "bg-emerald-100 text-emerald-700", dot: "bg-emerald-500" },
     { label: "Errors", count: errorCount, badge: "bg-rose-100 text-rose-700", dot: "bg-rose-500" },
-    { label: "Called", count: callCount, badge: "bg-indigo-100 text-indigo-700", dot: "bg-indigo-500" },
+    { label: "Calls", count: callCount, badge: "bg-indigo-100 text-indigo-700", dot: "bg-indigo-500" },
   ];
 
   return (
@@ -233,7 +204,7 @@ export default async function ActivityPage({
               <h2 className="text-lg font-bold text-gray-800">Recent Tool Calls</h2>
               <p className="text-xs text-gray-400 mt-0.5">
                 {showAll
-                  ? `Last ${LINES_SHOWN} log lines, newest first`
+                  ? `Last ${CALLS_SHOWN} calls, newest first`
                   : `Today \u00B7 ${todayDisplay} \u00B7 newest first`}
               </p>
             </div>
@@ -280,27 +251,29 @@ export default async function ActivityPage({
               <div className="px-6 py-16 text-center">
                 <div className="text-4xl mb-3">&#128220;</div>
                 <p className="text-gray-400 font-medium">
-                  {notFound
-                    ? "Log file not found"
+                  {dbError
+                    ? "Could not load activity"
                     : showAll
                       ? "No activity yet"
                       : "No activity yet today"}
                 </p>
                 <p className="text-gray-300 text-xs mt-1">
-                  {notFound
-                    ? "Expected logs/tool-calls.log in the project root"
+                  {dbError
+                    ? dbError
                     : showAll
                       ? "Tool calls will appear here once the MCP server is used"
                       : "New tool calls will appear here as the booking agent is used"}
                 </p>
               </div>
             ) : (
-              entries.map((entry, i) => {
-                const cfg = eventConfig(entry.event);
-                const { date, time } = formatTimestamp(entry.timestamp);
+              entries.map((entry) => {
+                const cfg = statusConfig(entry.status);
+                const { date, time } = formatTimestamp(entry.created_at);
+                const summary = resultSummary(entry.result);
+                const calledWith = paramsSummary(entry.params);
                 return (
                   <div
-                    key={`${entry.timestamp}-${i}`}
+                    key={entry.id}
                     className="flex items-start gap-4 px-6 py-4 hover:bg-indigo-50/40 transition-colors"
                   >
                     <div
@@ -311,7 +284,7 @@ export default async function ActivityPage({
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-mono text-sm font-semibold text-gray-800">
-                          {entry.tool}
+                          {entry.tool_name}
                         </span>
                         <span
                           className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold ${cfg.badge}`}
@@ -319,10 +292,11 @@ export default async function ActivityPage({
                           {cfg.label}
                         </span>
                       </div>
-                      {entry.detail && (
-                        <p className="text-xs text-gray-500 mt-1.5 break-words">
-                          {entry.detail}
-                        </p>
+                      {summary && (
+                        <p className="text-xs text-gray-500 mt-1.5 break-words">{summary}</p>
+                      )}
+                      {calledWith && (
+                        <p className="text-xs text-gray-400 mt-1 break-words">{calledWith}</p>
                       )}
                     </div>
                     <div className="text-right shrink-0">
