@@ -146,7 +146,7 @@ async function readLogLines(): Promise<{
 }> {
   for (const p of logPaths()) {
     try {
-      const content = await readFile(p, "utf-8");
+      const content = await readFile(/*turbopackIgnore: true*/ p, "utf-8");
       const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
       return { lines, notFound: false, logPath: p };
     } catch {
