@@ -1,4 +1,4 @@
-# FreshLook Salon — WhatsApp Booking Agent
+# Sana — AI WhatsApp Booking Assistant for Salons
 
 An AI-powered WhatsApp assistant that handles the full appointment lifecycle for a hair and beauty salon — checking availability, booking, cancelling, rescheduling, and sending reminders — with no human receptionist in the loop for routine requests.
 
